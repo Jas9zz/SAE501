@@ -1,0 +1,224 @@
+!#############################################################################
+!# REMFW - Configuration Cisco CSR1000v
+!# Site: Remote (WorldSkills France)
+!# Rôle: Routeur/Firewall du site distant
+!#############################################################################
+
+!--- Configuration de base ---
+hostname REMFW
+ip domain-name wsl2025.org
+no ip domain-lookup
+
+!--- Sécurité des mots de passe ---
+service password-encryption
+enable secret P@ssw0rd
+
+!--- Utilisateur admin ---
+username admin privilege 15 secret P@ssw0rd
+
+!--- Configuration SSH ---
+crypto key generate rsa modulus 2048
+ip ssh version 2
+ip ssh time-out 120
+ip ssh authentication-retries 3
+
+!--- Configuration des lignes VTY ---
+line vty 0 4
+ login local
+ transport input ssh
+ access-class SSH_ACCESS in
+ exec-timeout 5 0
+ absolute-timeout 20
+ banner login ^C
+/!\ Restricted access. Only for authorized people /!\
+^C
+line vty 5 15
+ login local
+ transport input ssh
+ access-class SSH_ACCESS in
+ exec-timeout 5 0
+ absolute-timeout 20
+ banner login ^C
+/!\ Restricted access. Only for authorized people /!\
+^C
+
+!--- Console ---
+line console 0
+ login local
+ exec-timeout 5 0
+
+!--- ACL pour accès SSH (Management network uniquement) ---
+ip access-list standard SSH_ACCESS
+ permit 10.3.99.0 0.0.0.255
+ deny any log
+
+!#############################################################################
+!# INTERFACES
+!#############################################################################
+
+!--- Interface LAN vers le site Remote (10.3.100.0/24) ---
+interface GigabitEthernet1
+ description LAN_REMOTE_SITE
+ ip address 10.3.100.254 255.255.255.0
+ ip nat inside
+ ip ospf 1 area 0
+ ip ospf network point-to-point
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 P@ssw0rd
+ no shutdown
+
+!--- Interface WAN vers WANRTR (MAN privé) ---
+interface GigabitEthernet2
+ description MAN_TO_WANRTR
+ ip address 10.116.3.2 255.255.255.252
+ ip nat outside
+ ip ospf 1 area 0
+ ip ospf network point-to-point
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 P@ssw0rd
+ ip ospf priority 0
+ no shutdown
+
+!#############################################################################
+!# ROUTAGE OSPF
+!#############################################################################
+
+router ospf 1
+ router-id 10.116.3.2
+ passive-interface GigabitEthernet1
+ network 10.3.100.0 0.0.0.255 area 0
+ network 10.116.3.0 0.0.0.3 area 0
+ default-information originate
+
+!--- Route par défaut vers WANRTR ---
+ip route 0.0.0.0 0.0.0.0 10.116.3.1
+
+!#############################################################################
+!# NAT/PAT (pour accès Internet via HQ)
+!#############################################################################
+
+!--- ACL pour le NAT ---
+ip access-list extended NAT_REMOTE
+ permit ip 10.3.100.0 0.0.0.255 any
+
+!--- NAT overload (PAT) ---
+ip nat inside source list NAT_REMOTE interface GigabitEthernet2 overload
+
+!#############################################################################
+!# FIREWALL - ACL de sécurité
+!#############################################################################
+
+!--- ACL entrante depuis HQ ---
+ip access-list extended ACL_FROM_HQ
+ remark === Services autorises depuis HQ ===
+ 
+ remark --- DNS ---
+ permit udp any any eq 53
+ permit tcp any any eq 53
+ 
+ remark --- HTTPS ---
+ permit tcp any any eq 443
+ 
+ remark --- SSH ---
+ permit tcp 10.3.99.0 0.0.0.255 any eq 22
+ 
+ remark --- Active Directory Services ---
+ remark LDAP
+ permit tcp any any eq 389
+ permit udp any any eq 389
+ remark LDAPS
+ permit tcp any any eq 636
+ remark Kerberos
+ permit tcp any any eq 88
+ permit udp any any eq 88
+ remark Global Catalog
+ permit tcp any any eq 3268
+ permit tcp any any eq 3269
+ remark AD Replication
+ permit tcp any any eq 135
+ permit udp any any eq 135
+ remark NetBIOS
+ permit tcp any any eq 137
+ permit udp any any eq 137
+ permit tcp any any eq 138
+ permit udp any any eq 138
+ permit tcp any any eq 139
+ permit udp any any eq 139
+ remark SMB/CIFS
+ permit tcp any any eq 445
+ permit udp any any eq 445
+ remark AD Web Services
+ permit tcp any any eq 9389
+ 
+ remark --- RDP ---
+ permit tcp any any eq 3389
+ 
+ remark --- ICMP ---
+ permit icmp any any echo
+ permit icmp any any echo-reply
+ 
+ remark --- NTP ---
+ permit udp any any eq 123
+ 
+ remark --- DHCP ---
+ permit udp any any eq 67
+ permit udp any any eq 68
+ 
+ remark --- Reponses etablies ---
+ permit tcp any any established
+ 
+ remark --- Bloquer tout le reste ---
+ deny ip any any log
+
+!--- ACL sortante vers HQ ---
+ip access-list extended ACL_TO_HQ
+ remark === Trafic autorise vers HQ ===
+ permit ip 10.3.100.0 0.0.0.255 any
+ deny ip any any log
+
+!--- Application des ACL ---
+interface GigabitEthernet2
+ ip access-group ACL_FROM_HQ in
+ ip access-group ACL_TO_HQ out
+
+!#############################################################################
+!# NTP
+!#############################################################################
+
+ntp authentication-key 1 md5 P@ssw0rd
+ntp authenticate
+ntp trusted-key 1
+ntp server 10.3.10.3 key 1
+
+!#############################################################################
+!# LOGGING
+!#############################################################################
+
+logging buffered 16384 informational
+logging console informational
+
+!#############################################################################
+!# SNMP (optionnel pour supervision)
+!#############################################################################
+
+snmp-server community public RO
+snmp-server community private RW
+snmp-server location Remote_Site_WSL2025
+snmp-server contact admin@wsl2025.org
+
+!#############################################################################
+!# EEM - Auto-recovery de l'interface MAN
+!#############################################################################
+
+event manager applet INTF_AUTO_RECOVERY
+ event syslog pattern "Interface GigabitEthernet2.*down"
+ action 1.0 cli command "enable"
+ action 2.0 cli command "configure terminal"
+ action 3.0 cli command "interface GigabitEthernet2"
+ action 4.0 cli command "no shutdown"
+ action 5.0 cli command "end"
+ action 6.0 syslog msg "Interface have been re-enabled automatically due to down status"
+
+!--- Sauvegarde de la configuration ---
+end
+write memory
